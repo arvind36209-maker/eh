@@ -1,0 +1,314 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>3D Survival - Refined Elite AI</title>
+<style>
+body { margin: 0; overflow: hidden; background: #000; }
+#hint {
+    position: absolute; top: 10px; left: 10px; color: white;
+    font-family: Arial; font-size: 14px; text-shadow: 1px 1px 2px black; z-index: 10;
+}
+#ui-stats {
+    position: absolute; top: 10px; right: 10px; color: #ffaa00;
+    font-family: 'Courier New', Courier, monospace; font-size: 20px; font-weight: bold; text-align: right;
+}
+#king-notif, #action-prompt {
+    position: absolute; left: 50%; transform: translateX(-50%);
+    font-family: 'Arial Black'; text-shadow: 2px 2px 10px black; z-index: 15; display: none;
+}
+#king-notif { top: 20%; color: #ffff00; font-size: 40px; }
+#action-prompt { top: 60%; color: #00ffff; font-size: 30px; }
+#hp-container {
+    position: absolute; bottom: 20px; left: 50%; transform: translateX(-50%);
+    width: 300px; height: 25px; background: rgba(0,0,0,0.5); border: 2px solid white;
+}
+#hp-bar { width: 100%; height: 100%; background: #00ffaa; transition: width 0.1s; }
+#death-screen {
+    position: absolute; top: 0; left: 0; width: 100%; height: 100%;
+    background: rgba(139, 0, 0, 0.9); display: none;
+    flex-direction: column; justify-content: center; align-items: center;
+    color: white; font-family: 'Arial Black', sans-serif; z-index: 20;
+}
+#death-screen h1 { font-size: 80px; margin: 0; }
+#death-screen button {
+    padding: 15px 30px; font-size: 20px; cursor: pointer; background: white; border: none; margin-top: 20px;
+}
+</style>
+</head>
+<body>
+
+<div id="hint">WASD = Move | SPACE = Jump | TAP E 5x near King!</div>
+<div id="king-notif">KING ASCENDED!</div>
+<div id="action-prompt">TAP E FAST! (<span id="e-count">0</span>/5)</div>
+<div id="ui-stats">SCORE: <span id="score-val">0</span>s<br>THREAT: <span id="threat-val">1.0</span>x</div>
+<div id="hp-container"><div id="hp-bar"></div></div>
+<div id="death-screen">
+    <h1 id="death-msg">YOU DIED!</h1>
+    <p>Survival Time: <span id="final-score">0</span>s</p>
+    <button onclick="restartGame()">RETRY</button>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.min.js"></script>
+
+<script>
+let scene, camera, renderer;
+let player, enemies = [];
+let playerHP = 1000000, isDead = false; 
+let velocityY = 0, playerVelX = 0, playerVelZ = 0;
+let isOnGround = false;
+
+// KING & SHOCKWAVE
+let currentKing = null, crown = null, shockwave = null;
+let kingActive = false, crownStolen = false;
+let lastKingTime = Date.now(), lastPullTime = 0;
+let ePresses = 0, eTimer = 0;
+
+// SCORE & DIFFICULTY
+let startTime = Date.now(), score = 0, difficulty = 1.0;
+let enemyBaseSpeed = 0.13, chargeMultiplier = 2.0, pushPower = 0.65;
+
+let yaw = 0, pitch = 0, mouseSensitivity = 0.002, keys = {};
+
+init();
+animate();
+
+function init() {
+    scene = new THREE.Scene();
+    const sky = new THREE.Mesh(new THREE.SphereGeometry(500,32,32), new THREE.MeshBasicMaterial({color:0x87CEEB, side:THREE.BackSide}));
+    scene.add(sky);
+
+    camera = new THREE.PerspectiveCamera(75, innerWidth/innerHeight, 0.1, 1000);
+    renderer = new THREE.WebGLRenderer({ antialias: true });
+    renderer.setSize(innerWidth, innerHeight);
+    document.body.appendChild(renderer.domElement);
+
+    scene.add(new THREE.AmbientLight(0xffffff, 0.5));
+    const sun = new THREE.DirectionalLight(0xffffff, 1);
+    sun.position.set(5, 15, 5);
+    scene.add(sun);
+
+    const ground = new THREE.Mesh(new THREE.BoxGeometry(45, 1, 45), new THREE.MeshStandardMaterial({color: 0x222222}));
+    ground.position.y = -0.5;
+    scene.add(ground);
+
+    player = new THREE.Mesh(new THREE.CapsuleGeometry(0.5, 1, 4, 16), new THREE.MeshStandardMaterial({color: 0xFFA500}));
+    scene.add(player);
+
+    crown = new THREE.Mesh(new THREE.TorusGeometry(0.4, 0.1, 8, 20), new THREE.MeshStandardMaterial({ color: 0xffff00, emissive: 0xaaaa00 }));
+    crown.rotation.x = Math.PI / 2;
+
+    shockwave = new THREE.Mesh(new THREE.TorusGeometry(1, 0.05, 16, 100), new THREE.MeshBasicMaterial({ color: 0xffffff, transparent: true, opacity: 0 }));
+    shockwave.rotation.x = Math.PI / 2;
+    scene.add(shockwave);
+
+    for(let i=0; i<8; i++) spawnEnemy(i);
+
+    window.addEventListener("keydown", e => {
+        keys[e.code] = true;
+        if(e.code === "KeyE" && kingActive && !crownStolen && !isDead) {
+            if(player.position.distanceTo(currentKing.position) < 3.5) {
+                if(ePresses === 0) eTimer = Date.now();
+                ePresses++;
+                document.getElementById('e-count').innerText = ePresses;
+            }
+        }
+    });
+    window.addEventListener("keyup", e => keys[e.code] = false);
+    document.addEventListener("mousedown", () => { if(!isDead) document.body.requestPointerLock(); });
+    document.addEventListener("mousemove", (e) => {
+        if(document.pointerLockElement === document.body && !isDead) {
+            yaw -= e.movementX * mouseSensitivity;
+            pitch = Math.max(-Math.PI/3, Math.min(Math.PI/3, pitch - e.movementY * mouseSensitivity));
+        }
+    });
+    setInterval(() => { if(!isDead) difficulty += 0.1; }, 10000);
+}
+
+function spawnEnemy(i) {
+    const en = new THREE.Mesh(new THREE.CapsuleGeometry(0.5, 1, 4, 12), new THREE.MeshStandardMaterial({color: 0xFF0000}));
+    en.userData = { vY: 0, onG: false, mode: 'STALK', modeTimer: Math.random() * 4000, blastX: 0, blastZ: 0 };
+    scene.add(en);
+    enemies.push(en);
+}
+
+function setKing() {
+    kingActive = true; crownStolen = false; ePresses = 0;
+    currentKing = enemies[Math.floor(Math.random() * enemies.length)];
+    currentKing.add(crown);
+    crown.position.set(0, 1.2, 0);
+    document.getElementById('king-notif').style.display = 'block';
+    document.getElementById('king-notif').innerText = "KING ASCENDED!";
+}
+
+function triggerShockwave() {
+    shockwave.position.copy(player.position).y = 0.2;
+    shockwave.scale.set(1, 1, 1);
+    shockwave.material.opacity = 1;
+
+    enemies.forEach(en => {
+        const dist = en.position.distanceTo(player.position);
+        if(dist < 15) {
+            const dir = new THREE.Vector3().subVectors(en.position, player.position).normalize();
+            const power = (15 - dist) * 0.22;
+            en.userData.blastX = dir.x * power;
+            en.userData.blastZ = dir.z * power;
+            en.userData.vY = 0.4;
+        }
+    });
+}
+
+function stealSuccess() {
+    crownStolen = true; kingActive = false;
+    currentKing.remove(crown);
+    player.add(crown);
+    crown.position.set(0, 1.2, 0);
+    triggerShockwave();
+    document.getElementById('king-notif').innerText = "CROWN STOLEN! SHOCKWAVE!";
+    document.getElementById('action-prompt').style.display = 'none';
+    enemies.forEach(en => en.material.color.set(0x00ff00));
+
+    setTimeout(() => {
+        if(isDead) return;
+        player.remove(crown);
+        crownStolen = false;
+        enemies.forEach(en => en.material.color.set(0xff0000));
+        document.getElementById('king-notif').style.display = 'none';
+        lastKingTime = Date.now();
+    }, 10000);
+}
+
+function restartGame() {
+    isDead = false; playerHP = 1000000; difficulty = 1.0;
+    startTime = Date.now(); lastKingTime = Date.now();
+    kingActive = false; crownStolen = false; ePresses = 0;
+    if(currentKing) currentKing.remove(crown);
+    player.remove(crown);
+    currentKing = null;
+    player.position.set(0, 5, 0); playerVelX = 0; playerVelZ = 0;
+    enemies.forEach(en => {
+        en.position.set(Math.random()*30-15, 1, Math.random()*30-15);
+        en.material.color.set(0xff0000);
+        en.userData.blastX = 0; en.userData.blastZ = 0;
+    });
+    document.getElementById('death-screen').style.display = 'none';
+    document.getElementById('king-notif').style.display = 'none';
+    document.getElementById('action-prompt').style.display = 'none';
+}
+
+function animate() {
+    requestAnimationFrame(animate);
+    if(isDead) return;
+
+    const now = Date.now();
+    score = Math.floor((now - startTime) / 1000);
+    document.getElementById('score-val').innerText = score;
+
+    if(!kingActive && !crownStolen && now - lastKingTime > 40000) setKing();
+
+    if(kingActive && !crownStolen) {
+        if(player.position.distanceTo(currentKing.position) < 3.5) {
+            document.getElementById('action-prompt').style.display = 'block';
+            if(ePresses >= 5) stealSuccess();
+            if(ePresses > 0 && now - eTimer > 1500) { ePresses = 0; document.getElementById('e-count').innerText = 0; }
+        } else {
+            document.getElementById('action-prompt').style.display = 'none';
+            ePresses = 0;
+        }
+        if(now - lastPullTime > 2000) {
+            const pull = new THREE.Vector3().subVectors(currentKing.position, player.position).normalize();
+            playerVelX += pull.x * 0.8; playerVelZ += pull.z * 0.8;
+            lastPullTime = now;
+        }
+    }
+
+    if(shockwave.material.opacity > 0) {
+        shockwave.scale.addScalar(0.4);
+        shockwave.material.opacity -= 0.02;
+    }
+
+    // Player Physics
+    const fwd = new THREE.Vector3(Math.sin(yaw), 0, Math.cos(yaw));
+    const side = new THREE.Vector3(Math.sin(yaw + Math.PI/2), 0, Math.cos(yaw + Math.PI/2));
+    if(keys["KeyW"]) { playerVelX -= fwd.x * 0.08; playerVelZ -= fwd.z * 0.08; }
+    if(keys["KeyS"]) { playerVelX += fwd.x * 0.08; playerVelZ += fwd.z * 0.08; }
+    if(keys["KeyA"]) { playerVelX -= side.x * 0.08; playerVelZ -= side.z * 0.08; }
+    if(keys["KeyD"]) { playerVelX += side.x * 0.08; playerVelZ += side.z * 0.08; }
+    player.position.x += playerVelX; player.position.z += playerVelZ;
+    playerVelX *= 0.88; playerVelZ *= 0.88;
+    if(keys["Space"] && isOnGround) { velocityY = 0.35; isOnGround = false; }
+    velocityY -= 0.02; player.position.y += velocityY;
+    if(player.position.y <= 1 && Math.abs(player.position.x) < 22.5 && Math.abs(player.position.z) < 22.5) {
+        player.position.y = 1; velocityY = 0; isOnGround = true;
+    } else isOnGround = false;
+
+    // AI LOGIC - RESTORED STATE MACHINE
+    enemies.forEach((en, i) => {
+        if(!crownStolen) {
+            let targetPos;
+            let currentSpeedMult = 1.0;
+
+            if(kingActive && en !== currentKing) {
+                // Bodyguard Logic
+                const toP = new THREE.Vector3().subVectors(player.position, currentKing.position).normalize();
+                targetPos = currentKing.position.clone().add(toP.multiplyScalar(2.5));
+                en.material.color.set(0x880000);
+            } else {
+                // YOUR ORIGINAL STATE MACHINE LOGIC
+                en.userData.modeTimer -= 16;
+                if(en.userData.modeTimer <= 0) {
+                    en.userData.mode = en.userData.mode === 'STALK' ? 'CHARGE' : 'STALK';
+                    en.userData.modeTimer = en.userData.mode === 'STALK' ? 3000 : 1500;
+                }
+
+                if(en.userData.mode === 'CHARGE' || kingActive) {
+                    targetPos = player.position.clone();
+                    currentSpeedMult = chargeMultiplier; // Pink Hyper Speed
+                    if(en !== currentKing) en.material.color.set(0xff00ff);
+                } else {
+                    const angle = (i / 5) * Math.PI * 2;
+                    targetPos = new THREE.Vector3(player.position.x + Math.cos(angle)*5, 1, player.position.z + Math.sin(angle)*5);
+                    en.material.color.set(0xff0000);
+                }
+            }
+            const dir = new THREE.Vector3().subVectors(targetPos, en.position).normalize();
+            en.position.x += dir.x * enemyBaseSpeed * difficulty * currentSpeedMult;
+            en.position.z += dir.z * enemyBaseSpeed * difficulty * currentSpeedMult;
+        }
+        
+        // Blast Physics
+        en.position.x += en.userData.blastX; en.position.z += en.userData.blastZ;
+        en.userData.blastX *= 0.92; en.userData.blastZ *= 0.92;
+        if(en.position.y > 1 || en.userData.vY > 0) { en.userData.vY -= 0.02; en.position.y += en.userData.vY; }
+        if(en.position.y <= 1) { en.position.y = 1; en.userData.vY = 0; en.userData.onG = true; }
+
+        if(!crownStolen && en.position.distanceTo(player.position) < 1.1) {
+            playerHP -= 0.35 * difficulty;
+            const p = new THREE.Vector3().subVectors(player.position, en.position).normalize();
+            playerVelX += p.x * 0.1; playerVelZ += p.z * 0.1;
+        }
+    });
+
+    document.getElementById('hp-bar').style.width = Math.min(100, (playerHP/1000000)*100) + '%';
+    document.getElementById('threat-val').innerText = difficulty.toFixed(1);
+
+    if(playerHP <= 0 || player.position.y < -15) {
+        isDead = true; document.exitPointerLock();
+        document.getElementById('final-score').innerText = score;
+        document.getElementById('death-screen').style.display = 'flex';
+        document.getElementById('king-notif').style.display = 'none';
+        document.getElementById('action-prompt').style.display = 'none';
+    }
+
+    const cOff = new THREE.Vector3(Math.sin(yaw)*Math.cos(pitch)*10, Math.sin(pitch)*10+2, Math.cos(yaw)*Math.cos(pitch)*10);
+    camera.position.copy(player.position).add(cOff);
+    camera.lookAt(player.position.x, player.position.y + 1, player.position.z);
+    renderer.render(scene, camera);
+}
+window.addEventListener("resize", () => {
+    camera.aspect = innerWidth/innerHeight; camera.updateProjectionMatrix();
+    renderer.setSize(innerWidth, innerHeight);
+});
+</script>
+</body>
+</html>
